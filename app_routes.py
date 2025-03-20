@@ -886,20 +886,80 @@ def run_clustering():
             flash(f'Erreur lors du clustering: {clustering_result.get("error", "Erreur inconnue")}', 'danger')
             return redirect(url_for('clustering'))
         
+        # Générer un ID unique pour le clustering
+        import uuid
+        import pickle
+        import os
+        clustering_id = f"clustering_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        
+        # Stocker le DataFrame résultant séparément si présent
+        if "result_df" in clustering_result:
+            transformation_manager.save_transformed_dataframe(file_id, clustering_result["result_df"])
+            # Faire une copie de result_df avant de le supprimer
+            result_df_copy = clustering_result["result_df"].copy()
+            # Supprimer le DataFrame du résultat avant de le sauvegarder
+            del clustering_result["result_df"]
+        
+        # Créer le dossier pour les résultats de clustering s'il n'existe pas
+        clustering_folder = os.path.join(app.config['UPLOAD_FOLDER'], 'clustering_results')
+        os.makedirs(clustering_folder, exist_ok=True)
+        
+        # Sauvegarder les résultats du clustering dans un fichier
+        clustering_file = os.path.join(clustering_folder, f"{clustering_id}.pkl")
+        with open(clustering_file, 'wb') as f:
+            pickle.dump(clustering_result, f)
+        
+        # Stocker uniquement l'ID du clustering dans la session
+        session['clustering_id'] = clustering_id
+        
         # Générer un résumé textuel du clustering
         cluster_summary = clustering_processor.generate_cluster_summary(clustering_result)
         
-        # Sauvegarder temporairement le résultat pour la session
-        session['clustering_result'] = clustering_result
+        # Journaliser le succès du stockage
+        logger.info(f"Résultats du clustering sauvegardés dans {clustering_file}")
+        
+        # Pour la page de résultats, nous avons besoin d'une copie sécurisée pour l'affichage
+        # Créer une version simplifiée (sérialisable) pour le rendu de la page
+        display_result = {
+            "success": clustering_result["success"],
+            "algorithm": clustering_result["algorithm"],
+            "n_clusters": clustering_result["n_clusters"],
+            "columns_used": clustering_result["columns_used"],
+            "labels": clustering_result["labels"],
+            "cluster_sizes": clustering_result["cluster_sizes"],
+            "pca_result": clustering_result["pca_result"],
+            "pca_explained_variance": clustering_result["pca_explained_variance"]
+        }
+        
+        # Ajouter des éléments spécifiques à l'algorithme
+        if algorithm == 'kmeans':
+            display_result["inertia"] = clustering_result.get("inertia")
+            display_result["silhouette_score"] = clustering_result.get("silhouette_score")
+            display_result["calinski_harabasz_score"] = clustering_result.get("calinski_harabasz_score")
+            display_result["cluster_stats"] = clustering_result.get("cluster_stats", [])
+        elif algorithm == 'dbscan':
+            display_result["noise_points"] = clustering_result.get("noise_points")
+            display_result["silhouette_score"] = clustering_result.get("silhouette_score")
+            display_result["calinski_harabasz_score"] = clustering_result.get("calinski_harabasz_score")
+            display_result["cluster_stats"] = clustering_result.get("cluster_stats", {})
+        elif algorithm == 'hierarchical':
+            display_result["silhouette_score"] = clustering_result.get("silhouette_score")
+            display_result["calinski_harabasz_score"] = clustering_result.get("calinski_harabasz_score")
+            display_result["cluster_stats"] = clustering_result.get("cluster_stats", [])
+        
+        # Remettre le DataFrame de résultats si nécessaire pour l'affichage
+        if "result_df_copy" in locals():
+            transformation_manager.save_transformed_dataframe(file_id, result_df_copy)
         
         return render_template('clustering.html',
                                df_info={'shape': df.shape},
                                numeric_columns=df.select_dtypes(include=['number']).columns.tolist(),
                                filename=filename,
-                               clustering_result=clustering_result,
+                               clustering_result=display_result,
                                cluster_summary=cluster_summary)
     
     except Exception as e:
+        app.logger.error(f"Erreur lors du clustering: {e}", exc_info=True)
         flash(f'Erreur lors du clustering: {str(e)}', 'danger')
         return redirect(url_for('clustering'))
 
@@ -1178,27 +1238,76 @@ def api_column_values():
 
 @app.route('/api/analyze_clusters_with_ai', methods=['POST'])
 def api_analyze_clusters_with_ai():
-    """API pour analyser les clusters avec l'IA"""
-    # Vérifier si des résultats de clustering sont disponibles
-    clustering_result = session.get('clustering_result')
+    """API pour analyser les clusters avec l'IA via Ollama"""
+    import logging
+    import traceback
+    import pickle
     
-    if not clustering_result:
-        return jsonify({"success": False, "error": "Aucun résultat de clustering trouvé"})
+    logger = logging.getLogger(__name__)
+    logger.info("Début de l'analyse des clusters avec IA")
+    
+    # Récupérer l'ID du clustering
+    clustering_id = session.get('clustering_id')
+    
+    if not clustering_id:
+        logger.warning("Aucun ID de clustering trouvé dans la session")
+        return jsonify({"success": False, "error": "Aucun résultat de clustering trouvé"}), 400
+    
+    # Chemin du fichier contenant les résultats du clustering
+    # Corriger le chemin pour inclure le sous-dossier clustering_results
+    clustering_folder = os.path.join(app.config['UPLOAD_FOLDER'], 'clustering_results')
+    clustering_file = os.path.join(clustering_folder, f"{clustering_id}.pkl")
+    
+    logger.info(f"Recherche du fichier de clustering: {clustering_file}")
+    
+    if not os.path.exists(clustering_file):
+        logger.warning(f"Fichier de clustering non trouvé: {clustering_file}")
+        return jsonify({"success": False, "error": "Résultats de clustering non disponibles"}), 400
+    
+    # Charger les résultats du clustering
+    try:
+        with open(clustering_file, 'rb') as f:
+            clustering_result = pickle.load(f)
+        
+        logger.info(f"Fichier de clustering chargé avec succès: {clustering_id}")
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement des résultats de clustering: {e}")
+        return jsonify({"success": False, "error": f"Erreur lors du chargement des résultats: {str(e)}"}), 500
     
     # Récupérer le contexte utilisateur
-    data = request.json
+    data = request.json or {}
     user_context = data.get('user_context', '')
+    logger.info(f"Contexte utilisateur reçu: {user_context[:50]}...")
     
     try:
-        # Initialiser le processeur de clustering
-        clustering_processor = ClusteringProcessor()
+        # S'assurer que clustering_processor est disponible
+        if 'clustering_processor' not in globals():
+            from modules.clustering_module import ClusteringProcessor
+            global clustering_processor
+            clustering_processor = ClusteringProcessor()
+            logger.info("Processeur de clustering initialisé")
         
         # Analyser les clusters
+        logger.info("Démarrage de l'analyse des clusters avec IA...")
         analysis_result = clustering_processor.analyze_clusters_with_ai(clustering_result, user_context)
+        
+        if analysis_result.get("success", False):
+            logger.info(f"Analyse réussie, {len(analysis_result.get('analysis', ''))} caractères générés")
+            # Tronquer pour le log
+            analysis_excerpt = analysis_result.get('analysis', '')[:100] + "..." if analysis_result.get('analysis') else ""
+            logger.info(f"Extrait: {analysis_excerpt}")
+        else:
+            logger.warning(f"Échec de l'analyse: {analysis_result.get('error')}")
         
         return jsonify(analysis_result)
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        error_trace = traceback.format_exc()
+        logger.error(f"Exception non gérée lors de l'analyse IA: {str(e)}\n{error_trace}")
+        return jsonify({
+            "success": False, 
+            "error": str(e),
+            "trace": error_trace
+        }), 500
 
 @app.route('/api/dataset_stats')
 def api_dataset_stats():
@@ -1742,6 +1851,82 @@ def calendar_view():
     return render_template('calendar_view.html', 
                            filename=session.get('filename'),
                            has_data=True)
+
+# ---------------------------------------------------------CLIENT ---------------------------------------------------
+
+@app.route('/api/client_demographics')
+def api_client_demographics():
+    """API pour récupérer les données démographiques des clients"""
+    # Vérifier si des données sont disponibles
+    file_id = session.get('file_id')
+    
+    if not file_id:
+        return jsonify({"success": False, "error": "Aucune donnée disponible"})
+    
+    # Récupérer le DataFrame
+    df = transformation_manager.get_current_dataframe(file_id)
+    
+    if df is None:
+        return jsonify({"success": False, "error": "Erreur lors de la récupération des données"})
+    
+    try:
+        demographics_data = {}
+        
+        # Distribution par genre
+        if 'genre' in df.columns:
+            gender_counts = df['genre'].value_counts().to_dict()
+            # Normaliser les clés en minuscules pour cohérence
+            normalized_gender_counts = {}
+            for key, value in gender_counts.items():
+                if pd.notna(key):
+                    normalized_key = key.lower() if isinstance(key, str) else key
+                    normalized_gender_counts[normalized_key] = value
+            demographics_data['gender_distribution'] = normalized_gender_counts
+        
+        # Distribution par âge
+        if 'age' in df.columns:
+            # Définir les tranches d'âge
+            age_bins = [0, 18, 25, 35, 50, 100]
+            age_labels = ['0-18', '19-25', '26-35', '36-50', '51+']
+            
+            # Créer une copie pour éviter les avertissements de modification avec pd.cut
+            df_age = df.copy()
+            
+            # Convertir en numérique si pas déjà fait
+            if not pd.api.types.is_numeric_dtype(df_age['age']):
+                df_age['age'] = pd.to_numeric(df_age['age'], errors='coerce')
+            
+            # Catégoriser les âges
+            df_age['age_group'] = pd.cut(df_age['age'], bins=age_bins, labels=age_labels, right=False)
+            
+            # Compter les occurrences par tranche d'âge
+            age_counts = df_age['age_group'].value_counts().sort_index()
+            
+            # Formater pour le graphique
+            demographics_data['age_distribution'] = {
+                'categories': age_counts.index.tolist(),
+                'values': age_counts.values.tolist()
+            }
+        
+        # Distribution par segment client
+        if 'segment_client' in df.columns:
+            segment_counts = df['segment_client'].value_counts().to_dict()
+            demographics_data['segment_distribution'] = segment_counts
+            
+            # Panier moyen par segment
+            if 'montant_total' in df.columns:
+                avg_basket = df.groupby('segment_client')['montant_total'].mean().round(2)
+                
+                demographics_data['avg_basket_by_segment'] = {
+                    'categories': avg_basket.index.tolist(),
+                    'values': avg_basket.values.tolist()
+                }
+        
+        return jsonify({"success": True, **demographics_data})
+        
+    except Exception as e:
+        app.logger.error(f"Erreur lors de la génération des statistiques démographiques: {e}")
+        return jsonify({"success": False, "error": str(e)})
 
 if __name__ == '__main__':
     app.run(debug=True)
